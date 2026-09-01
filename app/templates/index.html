@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MEXC MultiTrader</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --card:#151d33; --line:#2d3a5c; --text:#eaf0ff; --muted:#aab8d6; --warn:#ffca5f; --blue:#4d7cff; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:Arial,sans-serif; }
+    main { max-width:900px; margin:32px auto; padding:0 16px; }
+    .card { margin:16px 0; padding:18px; border:1px solid var(--line); border-radius:14px; background:var(--card); }
+    .banner { margin:18px 0; padding:12px; border:1px solid var(--warn); border-radius:10px; color:var(--warn); background:#3c3011; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
+    label { display:block; color:var(--muted); margin-bottom:7px; }
+    input, button { width:100%; padding:11px; border-radius:9px; border:1px solid var(--line); background:#0f1629; color:var(--text); }
+    button { margin-top:14px; border:0; cursor:pointer; font-weight:700; background:var(--blue); }
+    pre { overflow-wrap:anywhere; white-space:pre-wrap; padding:14px; border:1px solid var(--line); border-radius:10px; background:#0a0f1d; min-height:100px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>MEXC MultiTrader</h1>
+    <p>Панель просмотра futures-балансов нескольких MEXC API-аккаунтов.</p>
+
+    {% if not live_trading %}
+    <div class="banner">Режим безопасности: LIVE_TRADING=false. Отправка торговых заявок в этой версии отсутствует.</div>
+    {% endif %}
+
+    <section class="card">
+      <h2>Балансы</h2>
+      <div class="grid">
+        <div>
+          <label for="accountGroup">Группа аккаунтов</label>
+          <input id="accountGroup" placeholder="пусто = все включённые">
+        </div>
+      </div>
+      <button id="loadBalances">Обновить балансы</button>
+      <pre id="output">Балансы ещё не загружены.</pre>
+    </section>
+  </main>
+
+  <script>
+    document.getElementById("loadBalances").addEventListener("click", async () => {
+      const token = window.prompt("Введите X-Admin-Token");
+      if (!token) return;
+
+      const group = document.getElementById("accountGroup").value.trim();
+      const output = document.getElementById("output");
+      const url = group ? `/api/balances?account_group=${encodeURIComponent(group)}` : "/api/balances";
+      output.textContent = "Загрузка балансов…";
+
+      try {
+        const response = await fetch(url, { headers: { "X-Admin-Token": token } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+
+        const lines = [
+          `Аккаунтов: ${data.accounts_total}; успешно: ${data.accounts_success}; ошибок: ${data.accounts_failed}`,
+          `USDT equity: ${data.totals_usdt.equity}`,
+          `USDT свободно: ${data.totals_usdt.available_balance}`,
+          `USDT в марже: ${data.totals_usdt.position_margin}`,
+          `USDT unrealized PnL: ${data.totals_usdt.unrealized_pnl}`,
+          ""
+        ];
+
+        for (const account of data.accounts) {
+          lines.push(`[${account.status}] ${account.account_name} (${account.account_group || "без группы"})`);
+          if (account.error) lines.push(`Ошибка: ${account.error}`);
+          for (const asset of account.assets) {
+            if (asset.currency === "USDT") {
+              lines.push(`  USDT | equity=${asset.equity} | available=${asset.available_balance} | margin=${asset.position_margin} | PnL=${asset.unrealized_pnl}`);
+            }
+          }
+        }
+        output.textContent = lines.join("\n");
+      } catch (error) {
+        output.textContent = `Ошибка: ${error.message || String(error)}`;
+      }
+    });
+  </script>
+</body>
+</html>
