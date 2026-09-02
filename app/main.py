@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, create_engine, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     mexc_base_url: str = "https://contract.mexc.com"
     gate_base_url: str = "https://api.gateio.ws/api/v4"
     request_timeout_seconds: int = 15
+    symbol_sync_interval_seconds: int = 300
+    auto_allow_new_listings: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
@@ -141,6 +143,25 @@ class SystemCheckItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class KnownSymbol(Base):
+    """Tracks every contract/pair ever seen on each exchange so that a first
+    listing can be detected as a state transition (row inserted) rather than
+    re-derived by comparing against a static, manually maintained list."""
+
+    __tablename__ = "known_symbols"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    exchange: Mapped[str] = mapped_column(String(16), index=True)
+    symbol: Mapped[str] = mapped_column(String(50), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    base_coin: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    quote_coin: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    exchange_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    auto_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class AccountCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     exchange: Literal["MEXC", "GATE"] = "MEXC"
@@ -154,6 +175,10 @@ class AccountCreate(BaseModel):
 
 class AccountEnabledUpdate(BaseModel):
     enabled: bool
+
+
+class SymbolAllowUpdate(BaseModel):
+    allowed: bool
 
 
 class SignalIn(BaseModel):
@@ -186,7 +211,17 @@ def normalize_float(value: Any) -> float:
         return 0.0
 
 
+def utc_day_start_ms() -> int:
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000)
+
+
 class MexcFuturesClient:
+    """MEXC USDT-M Futures private/public REST client."""
+
+    exchange = "MEXC"
+
     def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -227,6 +262,15 @@ class MexcFuturesClient:
             params={"pageNum": page_num, "pageSize": page_size},
         )
 
+    async def get_daily_realized_pnl(self) -> float:
+        """Sum realized PnL + fees from history positions closed since UTC day start."""
+        raw = await self.get_history_positions()
+        data = raw.get("data") or {}
+        rows = data.get("resultList") if isinstance(data, dict) else data
+        rows = rows or []
+        start_ms = utc_day_start_ms()
+        return sum(realized_pnl(item) for item in rows if item_time_ms(item) >= start_ms)
+
 
 async def mexc_ping() -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
@@ -235,7 +279,44 @@ async def mexc_ping() -> dict[str, Any]:
     return response.json()
 
 
+async def mexc_list_contracts() -> list[dict[str, Any]]:
+    """Public endpoint, no signature required. Returns every contract MEXC
+    currently knows about (active, paused, delivered, offline, etc.)."""
+    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+        response = await client.get(f"{settings.mexc_base_url}/api/v1/contract/detail")
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, list) else []
+
+
+MEXC_STATE_ACTIVE = 0
+
+
+def normalize_mexc_contract(item: dict[str, Any]) -> dict[str, Any]:
+    state = item.get("state")
+    created_ms = item.get("createTime")
+    created_at = None
+    try:
+        if created_ms:
+            created_at = datetime.utcfromtimestamp(int(created_ms) / 1000)
+    except (TypeError, ValueError, OSError):
+        created_at = None
+    return {
+        "symbol": item.get("symbol"),
+        "status": "ACTIVE" if state == MEXC_STATE_ACTIVE else "INACTIVE",
+        "base_coin": item.get("baseCoin"),
+        "quote_coin": item.get("quoteCoin"),
+        "exchange_created_at": created_at,
+        "is_new_tag": bool(item.get("isNew")),
+    }
+
+
 class GateFuturesClient:
+    """Gate.io USDT-settled Futures private/public REST client."""
+
+    exchange = "GATE"
+
     def __init__(self, api_key: str, api_secret: str, settle: str = "usdt"):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -265,12 +346,65 @@ class GateFuturesClient:
     async def get_open_positions(self) -> Any:
         return await self._get(f"/futures/{self.settle}/positions")
 
+    async def get_account_book(self, start_ms: int, limit: int = 1000) -> Any:
+        """Gate.io account_book: ledger of pnl/fee/funding entries. `from` is in seconds."""
+        return await self._get(
+            f"/futures/{self.settle}/account_book",
+            params={"from": start_ms // 1000, "limit": limit},
+        )
+
+    async def get_daily_realized_pnl(self) -> float:
+        """Sum pnl-relevant account_book entries (pnl, fee, fund) since UTC day start."""
+        start_ms = utc_day_start_ms()
+        rows = await self.get_account_book(start_ms)
+        if not isinstance(rows, list):
+            return 0.0
+        relevant_types = {"pnl", "fee", "fund", "point_dnw", "settle"}
+        return sum(
+            normalize_float(item.get("change"))
+            for item in rows
+            if item.get("type") in relevant_types
+        )
+
 
 async def gate_ping() -> Any:
     async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
         response = await client.get(f"{settings.gate_base_url}/futures/usdt/contracts", params={"limit": 1})
     response.raise_for_status()
     return response.json()
+
+
+async def gate_list_contracts(settle: str = "usdt") -> list[dict[str, Any]]:
+    """Public endpoint, no signature required. Returns every contract Gate.io
+    currently lists for the given settle currency."""
+    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+        response = await client.get(f"{settings.gate_base_url}/futures/{settle}/contracts")
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, list) else []
+
+
+def normalize_gate_contract(item: dict[str, Any]) -> dict[str, Any]:
+    in_delisting = bool(item.get("in_delisting"))
+    created_s = item.get("create_time")
+    created_at = None
+    try:
+        if created_s:
+            created_at = datetime.utcfromtimestamp(float(created_s))
+    except (TypeError, ValueError, OSError):
+        created_at = None
+    symbol = item.get("name")
+    base_coin = quote_coin = None
+    if symbol and "_" in symbol:
+        base_coin, quote_coin = symbol.split("_", 1)
+    return {
+        "symbol": symbol,
+        "status": "INACTIVE" if in_delisting else "ACTIVE",
+        "base_coin": base_coin,
+        "quote_coin": quote_coin,
+        "exchange_created_at": created_at,
+        "is_new_tag": False,
+    }
 
 
 def make_client(account: "TradingAccount", secret: str):
@@ -305,6 +439,26 @@ def serialize_account(row: TradingAccount) -> dict[str, Any]:
     }
 
 
+def serialize_symbol(row: KnownSymbol) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "exchange": row.exchange,
+        "symbol": row.symbol,
+        "status": row.status,
+        "base_coin": row.base_coin,
+        "quote_coin": row.quote_coin,
+        "exchange_created_at": row.exchange_created_at.isoformat() + "Z" if row.exchange_created_at else None,
+        "first_seen_at": row.first_seen_at.isoformat() + "Z",
+        "last_seen_at": row.last_seen_at.isoformat() + "Z",
+        "auto_allowed": row.auto_allowed,
+        "tradeable": is_symbol_tradeable(row),
+    }
+
+
+def is_symbol_tradeable(row: KnownSymbol) -> bool:
+    return row.status == "ACTIVE" and (row.symbol in settings.allowed_symbols_set or row.auto_allowed)
+
+
 def safe_error(exc: Exception) -> str:
     return str(exc).replace(settings.admin_token, "[redacted]").replace(settings.fernet_key, "[redacted]")[:500]
 
@@ -329,12 +483,6 @@ def write_risk_event(db: Session, level: str, event_type: str, message: str, det
     db.commit()
 
 
-def utc_day_start_ms() -> int:
-    now = datetime.now(timezone.utc)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(start.timestamp() * 1000)
-
-
 def item_time_ms(item: dict[str, Any]) -> int:
     for key in ("updateTime", "closeTime", "createTime"):
         value = item.get(key)
@@ -356,19 +504,32 @@ def realized_pnl(item: dict[str, Any]) -> float:
 
 
 async def account_daily_pnl(account: TradingAccount) -> dict[str, Any]:
-    if account.exchange != "MEXC":
-        return {"account_id": account.id, "account_name": account.name, "pnl": 0.0, "status": "SKIPPED"}
+    """Realized PnL since UTC day start, implemented for both MEXC and Gate.io.
+
+    A failure here must be treated as unknown risk, not zero risk: the caller
+    (`daily_loss_status`) surfaces per-account `status` so a partial outage
+    does not silently understate the aggregated daily loss.
+    """
     try:
         secret = Fernet(settings.fernet_key.encode()).decrypt(account.api_secret_encrypted.encode()).decode()
-        raw = await MexcFuturesClient(account.api_key, secret).get_history_positions()
-        data = raw.get("data") or {}
-        rows = data.get("resultList") if isinstance(data, dict) else data
-        rows = rows or []
-        start_ms = utc_day_start_ms()
-        pnl = sum(realized_pnl(item) for item in rows if item_time_ms(item) >= start_ms)
-        return {"account_id": account.id, "account_name": account.name, "pnl": pnl, "status": "SUCCESS"}
+        client = make_client(account, secret)
+        pnl = await client.get_daily_realized_pnl()
+        return {
+            "account_id": account.id,
+            "account_name": account.name,
+            "exchange": account.exchange,
+            "pnl": pnl,
+            "status": "SUCCESS",
+        }
     except Exception as exc:
-        return {"account_id": account.id, "account_name": account.name, "pnl": 0.0, "status": "ERROR", "error": safe_error(exc)}
+        return {
+            "account_id": account.id,
+            "account_name": account.name,
+            "exchange": account.exchange,
+            "pnl": 0.0,
+            "status": "ERROR",
+            "error": safe_error(exc),
+        }
 
 
 async def daily_loss_status(db: Session) -> dict[str, Any]:
@@ -377,11 +538,13 @@ async def daily_loss_status(db: Session) -> dict[str, Any]:
     total_pnl = sum(item["pnl"] for item in results)
     loss = max(0.0, -total_pnl)
     limit = settings.max_daily_loss_usdt
+    any_unknown = any(item["status"] != "SUCCESS" for item in results)
     return {
         "limit_usdt": limit,
         "realized_pnl_usdt": round(total_pnl, 8),
         "loss_used_usdt": round(loss, 8),
-        "blocked": limit > 0 and loss >= limit,
+        "blocked": (limit > 0 and loss >= limit) or any_unknown,
+        "unknown_accounts": any_unknown,
         "accounts": results,
         "day_start_utc_ms": utc_day_start_ms(),
     }
@@ -447,6 +610,109 @@ async def load_all_positions(db: Session, account_group: str | None = None, exch
     accounts = list(db.scalars(query).all())
     results = await asyncio.gather(*(load_open_positions_for_account(account) for account in accounts))
     return {"generated_at": datetime.utcnow().isoformat() + "Z", "accounts": results}
+
+
+async def sync_symbol_listings(db: Session) -> dict[str, Any]:
+    """Fetch the full current contract list from each exchange's public API
+    and diff it against `known_symbols`. A row that does not exist yet is a
+    genuine first listing (or the first time this service has observed an
+    already-listed contract); it is recorded and raised as a NEW_LISTING risk
+    event immediately, without waiting for anyone to edit ALLOWED_SYMBOLS.
+
+    This function only performs discovery and record-keeping. Whether a
+    symbol becomes tradeable is decided separately by `is_symbol_tradeable`,
+    which additionally requires either static ALLOWED_SYMBOLS membership or
+    an explicit `auto_allowed` flag (set automatically only when
+    AUTO_ALLOW_NEW_LISTINGS=true, otherwise left for manual approval via
+    POST /api/symbols/{id}/allow).
+    """
+    discovered: dict[tuple[str, str], dict[str, Any]] = {}
+    fetch_errors: list[dict[str, str]] = []
+
+    try:
+        for raw in await mexc_list_contracts():
+            normalized = normalize_mexc_contract(raw)
+            if normalized["symbol"]:
+                discovered[("MEXC", normalized["symbol"])] = normalized
+    except Exception as exc:
+        fetch_errors.append({"exchange": "MEXC", "error": safe_error(exc)})
+
+    try:
+        for raw in await gate_list_contracts():
+            normalized = normalize_gate_contract(raw)
+            if normalized["symbol"]:
+                discovered[("GATE", normalized["symbol"])] = normalized
+    except Exception as exc:
+        fetch_errors.append({"exchange": "GATE", "error": safe_error(exc)})
+
+    existing = {
+        (row.exchange, row.symbol): row
+        for row in db.scalars(select(KnownSymbol)).all()
+    }
+
+    new_listings: list[dict[str, Any]] = []
+    now = datetime.utcnow()
+
+    for (exchange, symbol), info in discovered.items():
+        row = existing.get((exchange, symbol))
+        if row is None:
+            row = KnownSymbol(
+                exchange=exchange,
+                symbol=symbol,
+                status=info["status"],
+                base_coin=info["base_coin"],
+                quote_coin=info["quote_coin"],
+                exchange_created_at=info["exchange_created_at"],
+                first_seen_at=now,
+                last_seen_at=now,
+                auto_allowed=settings.auto_allow_new_listings,
+            )
+            db.add(row)
+            db.flush()
+            new_listings.append(serialize_symbol(row))
+            write_risk_event(
+                db,
+                "WARN",
+                "NEW_LISTING",
+                f"New {exchange} contract detected: {symbol}",
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "auto_allowed": row.auto_allowed,
+                    "exchange_created_at": info["exchange_created_at"].isoformat() + "Z" if info["exchange_created_at"] else None,
+                },
+            )
+        else:
+            row.status = info["status"]
+            row.base_coin = info["base_coin"] or row.base_coin
+            row.quote_coin = info["quote_coin"] or row.quote_coin
+            row.last_seen_at = now
+
+    db.commit()
+    return {
+        "synced_at": now.isoformat() + "Z",
+        "exchanges_checked": [exch for exch in ("MEXC", "GATE") if not any(e["exchange"] == exch for e in fetch_errors)],
+        "fetch_errors": fetch_errors,
+        "total_known_symbols": len(existing) + len(new_listings),
+        "new_listings": new_listings,
+    }
+
+
+async def symbol_sync_loop() -> None:
+    """Background task started at startup; periodically re-runs
+    `sync_symbol_listings` so a new listing is detected within
+    `SYMBOL_SYNC_INTERVAL_SECONDS` of appearing on the exchange, not only
+    when an operator happens to open the dashboard or run a manual check."""
+    interval = max(30, settings.symbol_sync_interval_seconds)
+    while True:
+        db = SessionLocal()
+        try:
+            await sync_symbol_listings(db)
+        except Exception:
+            pass
+        finally:
+            db.close()
+        await asyncio.sleep(interval)
 
 
 def get_latest_check(db: Session) -> SystemCheckRun | None:
@@ -530,6 +796,19 @@ async def run_system_check() -> dict[str, Any]:
         except Exception as exc:
             failures += 1
             add_check_item(db, run.id, "Gate public API", "FAIL", safe_error(exc))
+
+        try:
+            sync_result = await sync_symbol_listings(db)
+            if sync_result["fetch_errors"]:
+                warnings += 1
+                add_check_item(db, run.id, "Symbol listing sync", "WARN", f"{len(sync_result['fetch_errors'])} exchange(s) could not be queried", details=sync_result)
+            elif sync_result["new_listings"]:
+                add_check_item(db, run.id, "Symbol listing sync", "PASS", f"{len(sync_result['new_listings'])} new listing(s) detected", details=sync_result)
+            else:
+                add_check_item(db, run.id, "Symbol listing sync", "PASS", "No new listings since last sync")
+        except Exception as exc:
+            warnings += 1
+            add_check_item(db, run.id, "Symbol listing sync", "WARN", safe_error(exc))
 
         accounts = list(db.scalars(select(TradingAccount).order_by(TradingAccount.id)).all())
         enabled = [account for account in accounts if account.enabled]
@@ -656,6 +935,53 @@ def risk_gate(db: Session, dry_run: bool) -> tuple[bool, str | None]:
     return True, None
 
 
+def run_schema_migrations() -> None:
+    """Add columns that newer model versions expect but that pre-existing
+    SQLite tables do not have yet.
+
+    `Base.metadata.create_all()` only creates missing tables; it never alters
+    an existing table's columns. Without this step, adding a field to an ORM
+    model (as happened with `TradingAccount.exchange`) causes every read on
+    that table to fail with `OperationalError: no such column` until an
+    operator manually runs `ALTER TABLE`. This function makes that step
+    automatic and idempotent so `docker compose up -d --build` alone is
+    always enough after a `git pull`.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        existing_columns = {col["name"] for col in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing_columns:
+                continue
+            default_sql = _column_default_sql(column)
+            ddl = f"ALTER TABLE {table.name} ADD COLUMN {column.name} {column.type}"
+            if default_sql is not None:
+                ddl += f" DEFAULT {default_sql}"
+            with engine.begin() as conn:
+                conn.exec_driver_sql(ddl)
+
+
+def _column_default_sql(column) -> str | None:
+    """Best-effort literal default for a newly added column, used only for
+    the ALTER TABLE statement itself (SQLAlchemy's Python-side defaults still
+    apply for rows inserted after migration)."""
+    if column.default is not None and getattr(column.default, "is_scalar", False):
+        value = column.default.arg
+        if isinstance(value, str):
+            return "'" + value.replace("'", "''") + "'"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (int, float)):
+            return str(value)
+    if not column.nullable:
+        return "''" if str(column.type).startswith(("VARCHAR", "TEXT")) else "0"
+    return None
+
+
 app = FastAPI(title=settings.app_name)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -663,8 +989,10 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 @app.on_event("startup")
 async def init_database():
     Base.metadata.create_all(bind=engine)
+    run_schema_migrations()
     if settings.run_startup_self_check:
         asyncio.create_task(run_system_check())
+    asyncio.create_task(symbol_sync_loop())
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -728,6 +1056,18 @@ async def delete_account(account_id: int, db: Session = Depends(get_db)):
             detail="Account has open positions on the exchange; close them before deleting",
         )
 
+    recheck = await load_open_positions_for_account(account)
+    if recheck["status"] == "SUCCESS" and recheck["positions"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Account has open positions on the exchange; close them before deleting",
+        )
+    if recheck["status"] != "SUCCESS":
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify the account has no open positions; deletion aborted",
+        )
+
     name = account.name
     db.delete(account)
     db.commit()
@@ -774,12 +1114,57 @@ async def system_check_now():
     return await run_system_check()
 
 
+@app.get("/api/symbols", dependencies=[Depends(require_token)])
+def list_symbols(exchange: str | None = None, only_new: bool = False, db: Session = Depends(get_db)):
+    query = select(KnownSymbol).order_by(KnownSymbol.first_seen_at.desc())
+    if exchange:
+        query = query.where(KnownSymbol.exchange == exchange.upper())
+    rows = list(db.scalars(query).all())
+    serialized = [serialize_symbol(row) for row in rows]
+    if only_new:
+        serialized = [row for row in serialized if not row["tradeable"]]
+    return serialized
+
+
+@app.post("/api/symbols/sync", dependencies=[Depends(require_token)])
+async def sync_symbols_now(db: Session = Depends(get_db)):
+    return await sync_symbol_listings(db)
+
+
+@app.patch("/api/symbols/{symbol_id}/allow", dependencies=[Depends(require_token)])
+def allow_symbol(symbol_id: int, payload: SymbolAllowUpdate, db: Session = Depends(get_db)):
+    """Manually approve (or revoke approval for) a discovered symbol for
+    trading, independent of the static ALLOWED_SYMBOLS list. This is the
+    default path for turning a first-listing detection into something the
+    risk gate in /api/signals will actually accept, unless
+    AUTO_ALLOW_NEW_LISTINGS=true already set it automatically at discovery
+    time."""
+    row = db.get(KnownSymbol, symbol_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    row.auto_allowed = payload.allowed
+    db.commit()
+    db.refresh(row)
+    write_risk_event(
+        db,
+        "WARN" if payload.allowed else "INFO",
+        "SYMBOL_ALLOW_UPDATED",
+        f"{row.exchange} {row.symbol} trading approval set to {payload.allowed}",
+        {"symbol_id": row.id, "exchange": row.exchange, "symbol": row.symbol},
+    )
+    return serialize_symbol(row)
+
+
 @app.post("/api/signals", dependencies=[Depends(require_token)])
 async def submit_signal(payload: SignalIn, db: Session = Depends(get_db)):
     if db.scalar(select(TradeBatch).where(TradeBatch.request_id == payload.request_id)):
         raise HTTPException(status_code=409, detail="request_id has already been processed")
-    if payload.symbol not in settings.allowed_symbols_set:
+    known = db.scalar(select(KnownSymbol).where(KnownSymbol.symbol == payload.symbol))
+    symbol_allowed = payload.symbol in settings.allowed_symbols_set or (known is not None and known.auto_allowed)
+    if not symbol_allowed:
         raise HTTPException(status_code=400, detail="Symbol is not allowed")
+    if known is not None and known.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Symbol is not currently active on its exchange")
     if payload.leverage > settings.max_leverage or payload.volume > settings.max_order_vol:
         raise HTTPException(status_code=400, detail="Global risk limit exceeded")
     allowed, reason = risk_gate(db, payload.dry_run)
@@ -801,8 +1186,8 @@ async def submit_signal(payload: SignalIn, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail=f"Volume exceeds limit for {account.name}")
     daily = await daily_loss_status(db)
     if not payload.dry_run and daily["blocked"]:
-        write_risk_event(db, "CRITICAL", "DAILY_LOSS_LIMIT", "Daily loss limit reached", daily)
-        raise HTTPException(status_code=423, detail="Daily loss limit reached")
+        write_risk_event(db, "CRITICAL", "DAILY_LOSS_LIMIT", "Daily loss limit reached or unverifiable", daily)
+        raise HTTPException(status_code=423, detail="Daily loss limit reached or could not be verified for all accounts")
     positions = await load_all_positions(db, payload.account_group)
     position_index = {item["account_id"]: item for item in positions["accounts"]}
     batch = TradeBatch(request_id=payload.request_id, symbol=payload.symbol, direction=payload.direction, volume=payload.volume, leverage=payload.leverage, dry_run=True if not settings.live_trading else payload.dry_run, request_payload=payload.model_dump())
