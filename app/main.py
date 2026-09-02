@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, create_engine, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -186,7 +186,17 @@ def normalize_float(value: Any) -> float:
         return 0.0
 
 
+def utc_day_start_ms() -> int:
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000)
+
+
 class MexcFuturesClient:
+    """MEXC USDT-M Futures private/public REST client."""
+
+    exchange = "MEXC"
+
     def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -227,6 +237,15 @@ class MexcFuturesClient:
             params={"pageNum": page_num, "pageSize": page_size},
         )
 
+    async def get_daily_realized_pnl(self) -> float:
+        """Sum realized PnL + fees from history positions closed since UTC day start."""
+        raw = await self.get_history_positions()
+        data = raw.get("data") or {}
+        rows = data.get("resultList") if isinstance(data, dict) else data
+        rows = rows or []
+        start_ms = utc_day_start_ms()
+        return sum(realized_pnl(item) for item in rows if item_time_ms(item) >= start_ms)
+
 
 async def mexc_ping() -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
@@ -236,6 +255,10 @@ async def mexc_ping() -> dict[str, Any]:
 
 
 class GateFuturesClient:
+    """Gate.io USDT-settled Futures private/public REST client."""
+
+    exchange = "GATE"
+
     def __init__(self, api_key: str, api_secret: str, settle: str = "usdt"):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -264,6 +287,26 @@ class GateFuturesClient:
 
     async def get_open_positions(self) -> Any:
         return await self._get(f"/futures/{self.settle}/positions")
+
+    async def get_account_book(self, start_ms: int, limit: int = 1000) -> Any:
+        """Gate.io account_book: ledger of pnl/fee/funding entries. `from` is in seconds."""
+        return await self._get(
+            f"/futures/{self.settle}/account_book",
+            params={"from": start_ms // 1000, "limit": limit},
+        )
+
+    async def get_daily_realized_pnl(self) -> float:
+        """Sum pnl-relevant account_book entries (pnl, fee, fund) since UTC day start."""
+        start_ms = utc_day_start_ms()
+        rows = await self.get_account_book(start_ms)
+        if not isinstance(rows, list):
+            return 0.0
+        relevant_types = {"pnl", "fee", "fund", "point_dnw", "settle"}
+        return sum(
+            normalize_float(item.get("change"))
+            for item in rows
+            if item.get("type") in relevant_types
+        )
 
 
 async def gate_ping() -> Any:
@@ -329,12 +372,6 @@ def write_risk_event(db: Session, level: str, event_type: str, message: str, det
     db.commit()
 
 
-def utc_day_start_ms() -> int:
-    now = datetime.now(timezone.utc)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(start.timestamp() * 1000)
-
-
 def item_time_ms(item: dict[str, Any]) -> int:
     for key in ("updateTime", "closeTime", "createTime"):
         value = item.get(key)
@@ -356,19 +393,32 @@ def realized_pnl(item: dict[str, Any]) -> float:
 
 
 async def account_daily_pnl(account: TradingAccount) -> dict[str, Any]:
-    if account.exchange != "MEXC":
-        return {"account_id": account.id, "account_name": account.name, "pnl": 0.0, "status": "SKIPPED"}
+    """Realized PnL since UTC day start, implemented for both MEXC and Gate.io.
+
+    A failure here must be treated as unknown risk, not zero risk: the caller
+    (`daily_loss_status`) surfaces per-account `status` so a partial outage
+    does not silently understate the aggregated daily loss.
+    """
     try:
         secret = Fernet(settings.fernet_key.encode()).decrypt(account.api_secret_encrypted.encode()).decode()
-        raw = await MexcFuturesClient(account.api_key, secret).get_history_positions()
-        data = raw.get("data") or {}
-        rows = data.get("resultList") if isinstance(data, dict) else data
-        rows = rows or []
-        start_ms = utc_day_start_ms()
-        pnl = sum(realized_pnl(item) for item in rows if item_time_ms(item) >= start_ms)
-        return {"account_id": account.id, "account_name": account.name, "pnl": pnl, "status": "SUCCESS"}
+        client = make_client(account, secret)
+        pnl = await client.get_daily_realized_pnl()
+        return {
+            "account_id": account.id,
+            "account_name": account.name,
+            "exchange": account.exchange,
+            "pnl": pnl,
+            "status": "SUCCESS",
+        }
     except Exception as exc:
-        return {"account_id": account.id, "account_name": account.name, "pnl": 0.0, "status": "ERROR", "error": safe_error(exc)}
+        return {
+            "account_id": account.id,
+            "account_name": account.name,
+            "exchange": account.exchange,
+            "pnl": 0.0,
+            "status": "ERROR",
+            "error": safe_error(exc),
+        }
 
 
 async def daily_loss_status(db: Session) -> dict[str, Any]:
@@ -377,11 +427,13 @@ async def daily_loss_status(db: Session) -> dict[str, Any]:
     total_pnl = sum(item["pnl"] for item in results)
     loss = max(0.0, -total_pnl)
     limit = settings.max_daily_loss_usdt
+    any_unknown = any(item["status"] != "SUCCESS" for item in results)
     return {
         "limit_usdt": limit,
         "realized_pnl_usdt": round(total_pnl, 8),
         "loss_used_usdt": round(loss, 8),
-        "blocked": limit > 0 and loss >= limit,
+        "blocked": (limit > 0 and loss >= limit) or any_unknown,
+        "unknown_accounts": any_unknown,
         "accounts": results,
         "day_start_utc_ms": utc_day_start_ms(),
     }
@@ -656,6 +708,53 @@ def risk_gate(db: Session, dry_run: bool) -> tuple[bool, str | None]:
     return True, None
 
 
+def run_schema_migrations() -> None:
+    """Add columns that newer model versions expect but that pre-existing
+    SQLite tables do not have yet.
+
+    `Base.metadata.create_all()` only creates missing tables; it never alters
+    an existing table's columns. Without this step, adding a field to an ORM
+    model (as happened with `TradingAccount.exchange`) causes every read on
+    that table to fail with `OperationalError: no such column` until an
+    operator manually runs `ALTER TABLE`. This function makes that step
+    automatic and idempotent so `docker compose up -d --build` alone is
+    always enough after a `git pull`.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        existing_columns = {col["name"] for col in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing_columns:
+                continue
+            default_sql = _column_default_sql(column)
+            ddl = f"ALTER TABLE {table.name} ADD COLUMN {column.name} {column.type}"
+            if default_sql is not None:
+                ddl += f" DEFAULT {default_sql}"
+            with engine.begin() as conn:
+                conn.exec_driver_sql(ddl)
+
+
+def _column_default_sql(column) -> str | None:
+    """Best-effort literal default for a newly added column, used only for
+    the ALTER TABLE statement itself (SQLAlchemy's Python-side defaults still
+    apply for rows inserted after migration)."""
+    if column.default is not None and getattr(column.default, "is_scalar", False):
+        value = column.default.arg
+        if isinstance(value, str):
+            return "'" + value.replace("'", "''") + "'"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (int, float)):
+            return str(value)
+    if not column.nullable:
+        return "''" if str(column.type).startswith(("VARCHAR", "TEXT")) else "0"
+    return None
+
+
 app = FastAPI(title=settings.app_name)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -663,6 +762,7 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 @app.on_event("startup")
 async def init_database():
     Base.metadata.create_all(bind=engine)
+    run_schema_migrations()
     if settings.run_startup_self_check:
         asyncio.create_task(run_system_check())
 
@@ -726,6 +826,18 @@ async def delete_account(account_id: int, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=409,
             detail="Account has open positions on the exchange; close them before deleting",
+        )
+
+    recheck = await load_open_positions_for_account(account)
+    if recheck["status"] == "SUCCESS" and recheck["positions"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Account has open positions on the exchange; close them before deleting",
+        )
+    if recheck["status"] != "SUCCESS":
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify the account has no open positions; deletion aborted",
         )
 
     name = account.name
@@ -801,8 +913,8 @@ async def submit_signal(payload: SignalIn, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail=f"Volume exceeds limit for {account.name}")
     daily = await daily_loss_status(db)
     if not payload.dry_run and daily["blocked"]:
-        write_risk_event(db, "CRITICAL", "DAILY_LOSS_LIMIT", "Daily loss limit reached", daily)
-        raise HTTPException(status_code=423, detail="Daily loss limit reached")
+        write_risk_event(db, "CRITICAL", "DAILY_LOSS_LIMIT", "Daily loss limit reached or unverifiable", daily)
+        raise HTTPException(status_code=423, detail="Daily loss limit reached or could not be verified for all accounts")
     positions = await load_all_positions(db, payload.account_group)
     position_index = {item["account_id"]: item for item in positions["accounts"]}
     batch = TradeBatch(request_id=payload.request_id, symbol=payload.symbol, direction=payload.direction, volume=payload.volume, leverage=payload.leverage, dry_run=True if not settings.live_trading else payload.dry_run, request_payload=payload.model_dump())
