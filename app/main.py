@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     mexc_base_url: str = "https://contract.mexc.com"
     gate_base_url: str = "https://api.gateio.ws/api/v4"
     request_timeout_seconds: int = 15
+    listing_request_timeout_seconds: int = 30
+    listing_fetch_retries: int = 1
     symbol_sync_interval_seconds: int = 300
     auto_allow_new_listings: bool = False
 
@@ -217,6 +219,31 @@ def utc_day_start_ms() -> int:
     return int(start.timestamp() * 1000)
 
 
+async def fetch_with_retry(request_fn, retries: int) -> Any:
+    """Run an async no-arg request callable, retrying on timeouts/connection
+    errors up to `retries` extra times with a short linear backoff.
+
+    Gate.io's full contract list occasionally times out from some server
+    network paths even though the endpoint itself is healthy (confirmed via
+    an out-of-band fetch returning instantly). A single slow read should not
+    permanently mark an exchange as unreachable for an entire sync cycle if a
+    prompt retry would succeed.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await request_fn()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                await asyncio.sleep(1 + attempt)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("unreachable")
+
+
 class MexcFuturesClient:
     """MEXC USDT-M Futures private/public REST client."""
 
@@ -279,15 +306,22 @@ async def mexc_ping() -> dict[str, Any]:
     return response.json()
 
 
-async def mexc_list_contracts() -> list[dict[str, Any]]:
-    """Public endpoint, no signature required. Returns every contract MEXC
-    currently knows about (active, paused, delivered, offline, etc.)."""
-    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+async def _fetch_mexc_contracts_once() -> list[dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=settings.listing_request_timeout_seconds) as client:
         response = await client.get(f"{settings.mexc_base_url}/api/v1/contract/detail")
     response.raise_for_status()
     payload = response.json()
     data = payload.get("data") if isinstance(payload, dict) else None
     return data if isinstance(data, list) else []
+
+
+async def mexc_list_contracts() -> list[dict[str, Any]]:
+    """Public endpoint, no signature required. Returns every contract MEXC
+    currently knows about (active, paused, delivered, offline, etc.). Uses
+    LISTING_REQUEST_TIMEOUT_SECONDS (longer than the private-call timeout)
+    and a short retry, since this response is large and has been observed to
+    occasionally time out from some server network paths."""
+    return await fetch_with_retry(_fetch_mexc_contracts_once, settings.listing_fetch_retries)
 
 
 MEXC_STATE_ACTIVE = 0
@@ -374,14 +408,20 @@ async def gate_ping() -> Any:
     return response.json()
 
 
-async def gate_list_contracts(settle: str = "usdt") -> list[dict[str, Any]]:
-    """Public endpoint, no signature required. Returns every contract Gate.io
-    currently lists for the given settle currency."""
-    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+async def _fetch_gate_contracts_once(settle: str) -> list[dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=settings.listing_request_timeout_seconds) as client:
         response = await client.get(f"{settings.gate_base_url}/futures/{settle}/contracts")
     response.raise_for_status()
     payload = response.json()
     return payload if isinstance(payload, list) else []
+
+
+async def gate_list_contracts(settle: str = "usdt") -> list[dict[str, Any]]:
+    """Public endpoint, no signature required. Returns every contract Gate.io
+    currently lists for the given settle currency. Uses
+    LISTING_REQUEST_TIMEOUT_SECONDS and a short retry for the same reason as
+    `mexc_list_contracts`."""
+    return await fetch_with_retry(lambda: _fetch_gate_contracts_once(settle), settings.listing_fetch_retries)
 
 
 def normalize_gate_contract(item: dict[str, Any]) -> dict[str, Any]:
@@ -460,7 +500,14 @@ def is_symbol_tradeable(row: KnownSymbol) -> bool:
 
 
 def safe_error(exc: Exception) -> str:
-    return str(exc).replace(settings.admin_token, "[redacted]").replace(settings.fernet_key, "[redacted]")[:500]
+    """Redact secrets from an exception's string form, and preserve the
+    exception's type name when `str(exc)` is empty (e.g. httpx.ReadTimeout
+    and some httpx.ConnectError instances stringify to ''), so failures stay
+    diagnosable from API responses and logs alone."""
+    message = str(exc).strip()
+    if not message:
+        message = type(exc).__name__
+    return message.replace(settings.admin_token, "[redacted]").replace(settings.fernet_key, "[redacted]")[:500]
 
 
 def runtime_bool(db: Session, key: str, default: bool = False) -> bool:
