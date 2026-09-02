@@ -35,7 +35,8 @@ class Settings(BaseSettings):
     max_clock_drift_ms: int = 5000
     mexc_check_concurrency: int = 5
     system_check_max_age_seconds: int = 300
-    mexc_base_url: str = "https://api.mexc.com"
+    mexc_base_url: str = "https://contract.mexc.com"
+    gate_base_url: str = "https://api.gateio.ws/api/v4"
     request_timeout_seconds: int = 15
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
@@ -60,6 +61,7 @@ class TradingAccount(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    exchange: Mapped[str] = mapped_column(String(16), default="MEXC", index=True)
     account_group: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     api_key: Mapped[str] = mapped_column(String(255))
     api_secret_encrypted: Mapped[str] = mapped_column(Text)
@@ -141,6 +143,7 @@ class SystemCheckItem(Base):
 
 class AccountCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
+    exchange: Literal["MEXC", "GATE"] = "MEXC"
     account_group: str | None = Field(default=None, max_length=100)
     api_key: str = Field(min_length=10)
     api_secret: str = Field(min_length=10)
@@ -174,6 +177,13 @@ class SignalIn(BaseModel):
         if self.account_ids and self.account_group:
             raise ValueError("use account_ids or account_group, not both")
         return self
+
+
+def normalize_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class MexcFuturesClient:
@@ -225,6 +235,50 @@ async def mexc_ping() -> dict[str, Any]:
     return response.json()
 
 
+class GateFuturesClient:
+    def __init__(self, api_key: str, api_secret: str, settle: str = "usdt"):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.settle = settle
+
+    def _sign(self, method: str, path: str, query: str = "", body: str = "") -> dict[str, str]:
+        timestamp = str(int(time.time()))
+        body_hash = hashlib.sha512(body.encode()).hexdigest()
+        signing_string = "\n".join([method.upper(), f"/api/v4{path}", query, body_hash, timestamp])
+        signature = hmac.new(self.api_secret.encode(), signing_string.encode(), hashlib.sha512).hexdigest()
+        return {"KEY": self.api_key, "Timestamp": timestamp, "SIGN": signature, "Content-Type": "application/json"}
+
+    async def _get(self, path: str, params: dict[str, Any] | None = None, private: bool = True) -> Any:
+        query = ""
+        if params:
+            query = "&".join(f"{key}={value}" for key, value in params.items())
+        headers = self._sign("GET", path, query) if private else {}
+        url = f"{settings.gate_base_url}{path}"
+        async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+            response = await client.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        return response.json()
+
+    async def get_assets(self) -> Any:
+        return await self._get(f"/futures/{self.settle}/accounts")
+
+    async def get_open_positions(self) -> Any:
+        return await self._get(f"/futures/{self.settle}/positions")
+
+
+async def gate_ping() -> Any:
+    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+        response = await client.get(f"{settings.gate_base_url}/futures/usdt/contracts", params={"limit": 1})
+    response.raise_for_status()
+    return response.json()
+
+
+def make_client(account: "TradingAccount", secret: str):
+    if account.exchange == "GATE":
+        return GateFuturesClient(account.api_key, secret)
+    return MexcFuturesClient(account.api_key, secret)
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -238,17 +292,11 @@ def require_token(x_admin_token: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Invalid X-Admin-Token")
 
 
-def normalize_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def serialize_account(row: TradingAccount) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
+        "exchange": row.exchange,
         "account_group": row.account_group,
         "enabled": row.enabled,
         "max_order_vol": row.max_order_vol,
@@ -308,6 +356,8 @@ def realized_pnl(item: dict[str, Any]) -> float:
 
 
 async def account_daily_pnl(account: TradingAccount) -> dict[str, Any]:
+    if account.exchange != "MEXC":
+        return {"account_id": account.id, "account_name": account.name, "pnl": 0.0, "status": "SKIPPED"}
     try:
         secret = Fernet(settings.fernet_key.encode()).decrypt(account.api_secret_encrypted.encode()).decode()
         raw = await MexcFuturesClient(account.api_key, secret).get_history_positions()
@@ -337,38 +387,63 @@ async def daily_loss_status(db: Session) -> dict[str, Any]:
     }
 
 
+def normalize_mexc_positions(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    positions = []
+    for item in raw:
+        volume = normalize_float(item.get("holdVol"))
+        if volume <= 0:
+            continue
+        position_type = item.get("positionType")
+        positions.append({
+            "symbol": item.get("symbol"),
+            "side": "LONG" if position_type == 1 else "SHORT" if position_type == 2 else str(position_type),
+            "volume": volume,
+            "entry_price": normalize_float(item.get("holdAvgPrice")),
+            "leverage": item.get("leverage"),
+            "liquidation_price": normalize_float(item.get("liquidatePrice")),
+            "unrealized_pnl": normalize_float(item.get("unRealizedPnl")),
+        })
+    return positions
+
+
+def normalize_gate_positions(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    positions = []
+    for item in raw:
+        size = normalize_float(item.get("size"))
+        if size == 0:
+            continue
+        positions.append({
+            "symbol": item.get("contract"),
+            "side": "LONG" if size > 0 else "SHORT",
+            "volume": abs(size),
+            "entry_price": normalize_float(item.get("entry_price")),
+            "leverage": item.get("leverage"),
+            "liquidation_price": normalize_float(item.get("liq_price")),
+            "unrealized_pnl": normalize_float(item.get("unrealised_pnl")),
+        })
+    return positions
+
+
 async def load_open_positions_for_account(account: TradingAccount) -> dict[str, Any]:
     try:
         secret = Fernet(settings.fernet_key.encode()).decrypt(account.api_secret_encrypted.encode()).decode()
-        response = await MexcFuturesClient(account.api_key, secret).get_open_positions()
-        raw = response.get("data") or []
-        positions = []
-        for item in raw:
-            volume = normalize_float(item.get("holdVol"))
-            if volume <= 0:
-                continue
-            position_type = item.get("positionType")
-            positions.append({
-                "symbol": item.get("symbol"),
-                "side": "LONG" if position_type == 1 else "SHORT" if position_type == 2 else str(position_type),
-                "volume": volume,
-                "entry_price": normalize_float(item.get("holdAvgPrice")),
-                "leverage": item.get("leverage"),
-                "margin_mode": "ISOLATED" if item.get("openType") == 1 else "CROSS" if item.get("openType") == 2 else str(item.get("openType")),
-                "liquidation_price": normalize_float(item.get("liquidatePrice")),
-                "margin_ratio": normalize_float(item.get("marginRatio")),
-                "initial_margin": normalize_float(item.get("im")),
-                "unrealized_pnl": normalize_float(item.get("unRealizedPnl")),
-            })
-        return {"account_id": account.id, "account_name": account.name, "account_group": account.account_group, "status": "SUCCESS", "positions": positions}
+        client = make_client(account, secret)
+        response = await client.get_open_positions()
+        if account.exchange == "GATE":
+            positions = normalize_gate_positions(response if isinstance(response, list) else [])
+        else:
+            positions = normalize_mexc_positions((response.get("data") or []) if isinstance(response, dict) else [])
+        return {"account_id": account.id, "account_name": account.name, "exchange": account.exchange, "account_group": account.account_group, "status": "SUCCESS", "positions": positions}
     except Exception as exc:
-        return {"account_id": account.id, "account_name": account.name, "account_group": account.account_group, "status": "ERROR", "error": safe_error(exc), "positions": []}
+        return {"account_id": account.id, "account_name": account.name, "exchange": account.exchange, "account_group": account.account_group, "status": "ERROR", "error": safe_error(exc), "positions": []}
 
 
-async def load_all_positions(db: Session, account_group: str | None = None) -> dict[str, Any]:
+async def load_all_positions(db: Session, account_group: str | None = None, exchange: str | None = None) -> dict[str, Any]:
     query = select(TradingAccount).where(TradingAccount.enabled.is_(True))
     if account_group:
         query = query.where(TradingAccount.account_group == account_group)
+    if exchange:
+        query = query.where(TradingAccount.exchange == exchange)
     accounts = list(db.scalars(query).all())
     results = await asyncio.gather(*(load_open_positions_for_account(account) for account in accounts))
     return {"generated_at": datetime.utcnow().isoformat() + "Z", "accounts": results}
@@ -425,22 +500,36 @@ async def run_system_check() -> dict[str, Any]:
             started = time.perf_counter()
             pong = await mexc_ping()
             latency_ms = round((time.perf_counter() - started) * 1000)
-            server_time = normalize_float((pong.get("data") or {}).get("serverTime") or pong.get("serverTime"))
-            if not server_time:
-                server_time = normalize_float((pong.get("data") or {}).get("time"))
+            raw_data = pong.get("data") if isinstance(pong, dict) else None
+            server_time = 0.0
+            if isinstance(raw_data, dict):
+                server_time = normalize_float(raw_data.get("serverTime") or raw_data.get("time"))
+            elif isinstance(raw_data, (int, float, str)):
+                server_time = normalize_float(raw_data)
+            if not server_time and isinstance(pong, dict):
+                server_time = normalize_float(pong.get("serverTime") or pong.get("time"))
             drift_ms = int(abs(time.time() * 1000 - server_time)) if server_time else None
             add_check_item(db, run.id, "MEXC public API", "PASS", f"MEXC ping succeeded in {latency_ms} ms", details={"latency_ms": latency_ms})
             if drift_ms is None:
                 warnings += 1
-                add_check_item(db, run.id, "Clock synchronization", "WARN", "MEXC response did not contain a recognizable timestamp")
+                add_check_item(db, run.id, "MEXC clock synchronization", "WARN", "MEXC response did not contain a recognizable timestamp")
             elif drift_ms > settings.max_clock_drift_ms:
                 failures += 1
-                add_check_item(db, run.id, "Clock synchronization", "FAIL", f"Clock drift is {drift_ms} ms; limit is {settings.max_clock_drift_ms} ms", details={"drift_ms": drift_ms})
+                add_check_item(db, run.id, "MEXC clock synchronization", "FAIL", f"Clock drift is {drift_ms} ms; limit is {settings.max_clock_drift_ms} ms", details={"drift_ms": drift_ms})
             else:
-                add_check_item(db, run.id, "Clock synchronization", "PASS", f"Clock drift is {drift_ms} ms", details={"drift_ms": drift_ms})
+                add_check_item(db, run.id, "MEXC clock synchronization", "PASS", f"Clock drift is {drift_ms} ms", details={"drift_ms": drift_ms})
         except Exception as exc:
             failures += 1
             add_check_item(db, run.id, "MEXC public API", "FAIL", safe_error(exc))
+
+        try:
+            started = time.perf_counter()
+            await gate_ping()
+            latency_ms = round((time.perf_counter() - started) * 1000)
+            add_check_item(db, run.id, "Gate public API", "PASS", f"Gate ping succeeded in {latency_ms} ms", details={"latency_ms": latency_ms})
+        except Exception as exc:
+            failures += 1
+            add_check_item(db, run.id, "Gate public API", "FAIL", safe_error(exc))
 
         accounts = list(db.scalars(select(TradingAccount).order_by(TradingAccount.id)).all())
         enabled = [account for account in accounts if account.enabled]
@@ -453,17 +542,20 @@ async def run_system_check() -> dict[str, Any]:
             async def check_account(account: TradingAccount) -> list[tuple[str, str, str, str, dict[str, Any] | None]]:
                 try:
                     secret = Fernet(settings.fernet_key.encode()).decrypt(account.api_secret_encrypted.encode()).decode()
-                    client = MexcFuturesClient(account.api_key, secret)
+                    client = make_client(account, secret)
                     async with semaphore:
                         assets = await client.get_assets()
                         positions = await client.get_open_positions()
-                    result = [("Account balance access", "PASS", "Balance query succeeded", account.name, {"assets_received": len(assets.get("data") or [])})]
-                    result.append(("Account positions access", "PASS", "Positions query succeeded", account.name, {"positions_received": len(positions.get("data") or [])}))
-                    return result
+                    assets_count = len(assets) if isinstance(assets, list) else len((assets or {}).get("data") or [])
+                    positions_count = len(positions) if isinstance(positions, list) else len((positions or {}).get("data") or [])
+                    return [
+                        (f"{account.exchange} balance access", "PASS", "Balance query succeeded", account.name, {"items_received": assets_count}),
+                        (f"{account.exchange} positions access", "PASS", "Positions query succeeded", account.name, {"items_received": positions_count}),
+                    ]
                 except InvalidToken:
-                    return [("Account encryption", "FAIL", "Stored API secret cannot be decrypted with current FERNET_KEY", account.name, None)]
+                    return [(f"{account.exchange} encryption", "FAIL", "Stored API secret cannot be decrypted with current FERNET_KEY", account.name, None)]
                 except Exception as exc:
-                    return [("Account API access", "FAIL", safe_error(exc), account.name, None)]
+                    return [(f"{account.exchange} API access", "FAIL", safe_error(exc), account.name, None)]
 
             account_checks = await asyncio.gather(*(check_account(account) for account in enabled))
             for entries in account_checks:
@@ -477,12 +569,7 @@ async def run_system_check() -> dict[str, Any]:
         if kill_switch:
             warnings += 1
 
-        if failures:
-            overall = "FAIL"
-        elif warnings:
-            overall = "WARN"
-        else:
-            overall = "PASS"
+        overall = "FAIL" if failures else ("WARN" if warnings else "PASS")
         run.overall_status = overall
         run.completed_at = datetime.utcnow()
         run.summary = {"failures": failures, "warnings": warnings, "accounts_total": len(accounts), "accounts_enabled": len(enabled)}
@@ -495,22 +582,60 @@ async def run_system_check() -> dict[str, Any]:
 async def account_balance(account: TradingAccount) -> dict[str, Any]:
     try:
         secret = Fernet(settings.fernet_key.encode()).decrypt(account.api_secret_encrypted.encode()).decode()
-        response = await MexcFuturesClient(account.api_key, secret).get_assets()
-        assets = response.get("data") or []
-        normalized = [{"currency": asset.get("currency"), "equity": normalize_float(asset.get("equity")), "available_balance": normalize_float(asset.get("availableBalance")), "cash_balance": normalize_float(asset.get("cashBalance")), "position_margin": normalize_float(asset.get("positionMargin")), "frozen_balance": normalize_float(asset.get("frozenBalance")), "unrealized_pnl": normalize_float(asset.get("unrealized"))} for asset in assets]
-        return {"account_id": account.id, "account_name": account.name, "account_group": account.account_group, "status": "SUCCESS", "assets": normalized}
+        client = make_client(account, secret)
+        response = await client.get_assets()
+
+        normalized: list[dict[str, Any]] = []
+        if account.exchange == "GATE":
+            if isinstance(response, dict):
+                normalized = [{
+                    "currency": "USDT",
+                    "equity": normalize_float(response.get("total")),
+                    "available_balance": normalize_float(response.get("available")),
+                    "cash_balance": normalize_float(response.get("available")),
+                    "position_margin": normalize_float(response.get("position_margin")),
+                    "frozen_balance": normalize_float(response.get("order_margin")),
+                    "unrealized_pnl": normalize_float(response.get("unrealised_pnl")),
+                }]
+        else:
+            for asset in (response.get("data") or []) if isinstance(response, dict) else []:
+                normalized.append({
+                    "currency": asset.get("currency"),
+                    "equity": normalize_float(asset.get("equity")),
+                    "available_balance": normalize_float(asset.get("availableBalance")),
+                    "cash_balance": normalize_float(asset.get("cashBalance")),
+                    "position_margin": normalize_float(asset.get("positionMargin")),
+                    "frozen_balance": normalize_float(asset.get("frozenBalance")),
+                    "unrealized_pnl": normalize_float(asset.get("unrealized")),
+                })
+
+        return {"account_id": account.id, "account_name": account.name, "exchange": account.exchange, "account_group": account.account_group, "status": "SUCCESS", "assets": normalized}
     except Exception as exc:
-        return {"account_id": account.id, "account_name": account.name, "account_group": account.account_group, "status": "ERROR", "error": safe_error(exc), "assets": []}
+        return {"account_id": account.id, "account_name": account.name, "exchange": account.exchange, "account_group": account.account_group, "status": "ERROR", "error": safe_error(exc), "assets": []}
 
 
-async def balances(db: Session, account_group: str | None = None) -> dict[str, Any]:
+async def balances(db: Session, account_group: str | None = None, exchange: str | None = None) -> dict[str, Any]:
     query = select(TradingAccount).where(TradingAccount.enabled.is_(True))
     if account_group:
         query = query.where(TradingAccount.account_group == account_group)
+    if exchange:
+        query = query.where(TradingAccount.exchange == exchange)
     accounts = list(db.scalars(query).all())
     results = await asyncio.gather(*(account_balance(account) for account in accounts))
-    usdt = [asset for result in results for asset in result["assets"] if asset["currency"] == "USDT"]
-    return {"generated_at": datetime.utcnow().isoformat() + "Z", "accounts_total": len(accounts), "accounts_success": sum(item["status"] == "SUCCESS" for item in results), "accounts_failed": sum(item["status"] != "SUCCESS" for item in results), "totals_usdt": {"equity": round(sum(item["equity"] for item in usdt), 8), "available_balance": round(sum(item["available_balance"] for item in usdt), 8), "position_margin": round(sum(item["position_margin"] for item in usdt), 8), "unrealized_pnl": round(sum(item["unrealized_pnl"] for item in usdt), 8)}, "accounts": results}
+    usdt = [asset for result in results for asset in result["assets"] if asset.get("currency") == "USDT"]
+    return {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "accounts_total": len(accounts),
+        "accounts_success": sum(item["status"] == "SUCCESS" for item in results),
+        "accounts_failed": sum(item["status"] != "SUCCESS" for item in results),
+        "totals_usdt": {
+            "equity": round(sum(item["equity"] for item in usdt), 8),
+            "available_balance": round(sum(item["available_balance"] for item in usdt), 8),
+            "position_margin": round(sum(item["position_margin"] for item in usdt), 8),
+            "unrealized_pnl": round(sum(item["unrealized_pnl"] for item in usdt), 8),
+        },
+        "accounts": results,
+    }
 
 
 def risk_gate(db: Session, dry_run: bool) -> tuple[bool, str | None]:
@@ -558,7 +683,16 @@ def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
     if db.scalar(select(TradingAccount).where(TradingAccount.name == payload.name)):
         raise HTTPException(status_code=409, detail="Account name already exists")
     encrypted_secret = Fernet(settings.fernet_key.encode()).encrypt(payload.api_secret.encode()).decode()
-    account = TradingAccount(name=payload.name, account_group=payload.account_group, api_key=payload.api_key, api_secret_encrypted=encrypted_secret, enabled=payload.enabled, max_order_vol=payload.max_order_vol, max_leverage=payload.max_leverage)
+    account = TradingAccount(
+        name=payload.name,
+        exchange=payload.exchange,
+        account_group=payload.account_group,
+        api_key=payload.api_key,
+        api_secret_encrypted=encrypted_secret,
+        enabled=payload.enabled,
+        max_order_vol=payload.max_order_vol,
+        max_leverage=payload.max_leverage,
+    )
     db.add(account)
     db.commit()
     db.refresh(account)
@@ -581,14 +715,34 @@ def set_account_enabled(account_id: int, payload: AccountEnabledUpdate, db: Sess
     return serialize_account(account)
 
 
+@app.delete("/api/accounts/{account_id}", dependencies=[Depends(require_token)])
+async def delete_account(account_id: int, db: Session = Depends(get_db)):
+    account = db.get(TradingAccount, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    position_check = await load_open_positions_for_account(account)
+    if position_check["status"] == "SUCCESS" and position_check["positions"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Account has open positions on the exchange; close them before deleting",
+        )
+
+    name = account.name
+    db.delete(account)
+    db.commit()
+    write_risk_event(db, "WARN", "ACCOUNT_DELETED", f"Account {name} was deleted", {"account_id": account_id})
+    return {"deleted": True, "account_id": account_id}
+
+
 @app.get("/api/balances", dependencies=[Depends(require_token)])
-async def list_balances(account_group: str | None = None, db: Session = Depends(get_db)):
-    return await balances(db, account_group)
+async def list_balances(account_group: str | None = None, exchange: str | None = None, db: Session = Depends(get_db)):
+    return await balances(db, account_group, exchange)
 
 
 @app.get("/api/positions", dependencies=[Depends(require_token)])
-async def list_positions(account_group: str | None = None, db: Session = Depends(get_db)):
-    return await load_all_positions(db, account_group)
+async def list_positions(account_group: str | None = None, exchange: str | None = None, db: Session = Depends(get_db)):
+    return await load_all_positions(db, account_group, exchange)
 
 
 @app.get("/api/risk/status", dependencies=[Depends(require_token)])
