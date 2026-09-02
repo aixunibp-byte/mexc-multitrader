@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     mexc_base_url: str = "https://contract.mexc.com"
     gate_base_url: str = "https://api.gateio.ws/api/v4"
     request_timeout_seconds: int = 15
+    symbol_sync_interval_seconds: int = 300
+    auto_allow_new_listings: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
@@ -141,6 +143,25 @@ class SystemCheckItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class KnownSymbol(Base):
+    """Tracks every contract/pair ever seen on each exchange so that a first
+    listing can be detected as a state transition (row inserted) rather than
+    re-derived by comparing against a static, manually maintained list."""
+
+    __tablename__ = "known_symbols"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    exchange: Mapped[str] = mapped_column(String(16), index=True)
+    symbol: Mapped[str] = mapped_column(String(50), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    base_coin: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    quote_coin: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    exchange_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    auto_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class AccountCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     exchange: Literal["MEXC", "GATE"] = "MEXC"
@@ -154,6 +175,10 @@ class AccountCreate(BaseModel):
 
 class AccountEnabledUpdate(BaseModel):
     enabled: bool
+
+
+class SymbolAllowUpdate(BaseModel):
+    allowed: bool
 
 
 class SignalIn(BaseModel):
@@ -254,6 +279,39 @@ async def mexc_ping() -> dict[str, Any]:
     return response.json()
 
 
+async def mexc_list_contracts() -> list[dict[str, Any]]:
+    """Public endpoint, no signature required. Returns every contract MEXC
+    currently knows about (active, paused, delivered, offline, etc.)."""
+    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+        response = await client.get(f"{settings.mexc_base_url}/api/v1/contract/detail")
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, list) else []
+
+
+MEXC_STATE_ACTIVE = 0
+
+
+def normalize_mexc_contract(item: dict[str, Any]) -> dict[str, Any]:
+    state = item.get("state")
+    created_ms = item.get("createTime")
+    created_at = None
+    try:
+        if created_ms:
+            created_at = datetime.utcfromtimestamp(int(created_ms) / 1000)
+    except (TypeError, ValueError, OSError):
+        created_at = None
+    return {
+        "symbol": item.get("symbol"),
+        "status": "ACTIVE" if state == MEXC_STATE_ACTIVE else "INACTIVE",
+        "base_coin": item.get("baseCoin"),
+        "quote_coin": item.get("quoteCoin"),
+        "exchange_created_at": created_at,
+        "is_new_tag": bool(item.get("isNew")),
+    }
+
+
 class GateFuturesClient:
     """Gate.io USDT-settled Futures private/public REST client."""
 
@@ -316,6 +374,39 @@ async def gate_ping() -> Any:
     return response.json()
 
 
+async def gate_list_contracts(settle: str = "usdt") -> list[dict[str, Any]]:
+    """Public endpoint, no signature required. Returns every contract Gate.io
+    currently lists for the given settle currency."""
+    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+        response = await client.get(f"{settings.gate_base_url}/futures/{settle}/contracts")
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, list) else []
+
+
+def normalize_gate_contract(item: dict[str, Any]) -> dict[str, Any]:
+    in_delisting = bool(item.get("in_delisting"))
+    created_s = item.get("create_time")
+    created_at = None
+    try:
+        if created_s:
+            created_at = datetime.utcfromtimestamp(float(created_s))
+    except (TypeError, ValueError, OSError):
+        created_at = None
+    symbol = item.get("name")
+    base_coin = quote_coin = None
+    if symbol and "_" in symbol:
+        base_coin, quote_coin = symbol.split("_", 1)
+    return {
+        "symbol": symbol,
+        "status": "INACTIVE" if in_delisting else "ACTIVE",
+        "base_coin": base_coin,
+        "quote_coin": quote_coin,
+        "exchange_created_at": created_at,
+        "is_new_tag": False,
+    }
+
+
 def make_client(account: "TradingAccount", secret: str):
     if account.exchange == "GATE":
         return GateFuturesClient(account.api_key, secret)
@@ -346,6 +437,26 @@ def serialize_account(row: TradingAccount) -> dict[str, Any]:
         "max_leverage": row.max_leverage,
         "created_at": row.created_at.isoformat(),
     }
+
+
+def serialize_symbol(row: KnownSymbol) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "exchange": row.exchange,
+        "symbol": row.symbol,
+        "status": row.status,
+        "base_coin": row.base_coin,
+        "quote_coin": row.quote_coin,
+        "exchange_created_at": row.exchange_created_at.isoformat() + "Z" if row.exchange_created_at else None,
+        "first_seen_at": row.first_seen_at.isoformat() + "Z",
+        "last_seen_at": row.last_seen_at.isoformat() + "Z",
+        "auto_allowed": row.auto_allowed,
+        "tradeable": is_symbol_tradeable(row),
+    }
+
+
+def is_symbol_tradeable(row: KnownSymbol) -> bool:
+    return row.status == "ACTIVE" and (row.symbol in settings.allowed_symbols_set or row.auto_allowed)
 
 
 def safe_error(exc: Exception) -> str:
@@ -501,6 +612,109 @@ async def load_all_positions(db: Session, account_group: str | None = None, exch
     return {"generated_at": datetime.utcnow().isoformat() + "Z", "accounts": results}
 
 
+async def sync_symbol_listings(db: Session) -> dict[str, Any]:
+    """Fetch the full current contract list from each exchange's public API
+    and diff it against `known_symbols`. A row that does not exist yet is a
+    genuine first listing (or the first time this service has observed an
+    already-listed contract); it is recorded and raised as a NEW_LISTING risk
+    event immediately, without waiting for anyone to edit ALLOWED_SYMBOLS.
+
+    This function only performs discovery and record-keeping. Whether a
+    symbol becomes tradeable is decided separately by `is_symbol_tradeable`,
+    which additionally requires either static ALLOWED_SYMBOLS membership or
+    an explicit `auto_allowed` flag (set automatically only when
+    AUTO_ALLOW_NEW_LISTINGS=true, otherwise left for manual approval via
+    POST /api/symbols/{id}/allow).
+    """
+    discovered: dict[tuple[str, str], dict[str, Any]] = {}
+    fetch_errors: list[dict[str, str]] = []
+
+    try:
+        for raw in await mexc_list_contracts():
+            normalized = normalize_mexc_contract(raw)
+            if normalized["symbol"]:
+                discovered[("MEXC", normalized["symbol"])] = normalized
+    except Exception as exc:
+        fetch_errors.append({"exchange": "MEXC", "error": safe_error(exc)})
+
+    try:
+        for raw in await gate_list_contracts():
+            normalized = normalize_gate_contract(raw)
+            if normalized["symbol"]:
+                discovered[("GATE", normalized["symbol"])] = normalized
+    except Exception as exc:
+        fetch_errors.append({"exchange": "GATE", "error": safe_error(exc)})
+
+    existing = {
+        (row.exchange, row.symbol): row
+        for row in db.scalars(select(KnownSymbol)).all()
+    }
+
+    new_listings: list[dict[str, Any]] = []
+    now = datetime.utcnow()
+
+    for (exchange, symbol), info in discovered.items():
+        row = existing.get((exchange, symbol))
+        if row is None:
+            row = KnownSymbol(
+                exchange=exchange,
+                symbol=symbol,
+                status=info["status"],
+                base_coin=info["base_coin"],
+                quote_coin=info["quote_coin"],
+                exchange_created_at=info["exchange_created_at"],
+                first_seen_at=now,
+                last_seen_at=now,
+                auto_allowed=settings.auto_allow_new_listings,
+            )
+            db.add(row)
+            db.flush()
+            new_listings.append(serialize_symbol(row))
+            write_risk_event(
+                db,
+                "WARN",
+                "NEW_LISTING",
+                f"New {exchange} contract detected: {symbol}",
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "auto_allowed": row.auto_allowed,
+                    "exchange_created_at": info["exchange_created_at"].isoformat() + "Z" if info["exchange_created_at"] else None,
+                },
+            )
+        else:
+            row.status = info["status"]
+            row.base_coin = info["base_coin"] or row.base_coin
+            row.quote_coin = info["quote_coin"] or row.quote_coin
+            row.last_seen_at = now
+
+    db.commit()
+    return {
+        "synced_at": now.isoformat() + "Z",
+        "exchanges_checked": [exch for exch in ("MEXC", "GATE") if not any(e["exchange"] == exch for e in fetch_errors)],
+        "fetch_errors": fetch_errors,
+        "total_known_symbols": len(existing) + len(new_listings),
+        "new_listings": new_listings,
+    }
+
+
+async def symbol_sync_loop() -> None:
+    """Background task started at startup; periodically re-runs
+    `sync_symbol_listings` so a new listing is detected within
+    `SYMBOL_SYNC_INTERVAL_SECONDS` of appearing on the exchange, not only
+    when an operator happens to open the dashboard or run a manual check."""
+    interval = max(30, settings.symbol_sync_interval_seconds)
+    while True:
+        db = SessionLocal()
+        try:
+            await sync_symbol_listings(db)
+        except Exception:
+            pass
+        finally:
+            db.close()
+        await asyncio.sleep(interval)
+
+
 def get_latest_check(db: Session) -> SystemCheckRun | None:
     return db.scalar(select(SystemCheckRun).order_by(SystemCheckRun.id.desc()))
 
@@ -582,6 +796,19 @@ async def run_system_check() -> dict[str, Any]:
         except Exception as exc:
             failures += 1
             add_check_item(db, run.id, "Gate public API", "FAIL", safe_error(exc))
+
+        try:
+            sync_result = await sync_symbol_listings(db)
+            if sync_result["fetch_errors"]:
+                warnings += 1
+                add_check_item(db, run.id, "Symbol listing sync", "WARN", f"{len(sync_result['fetch_errors'])} exchange(s) could not be queried", details=sync_result)
+            elif sync_result["new_listings"]:
+                add_check_item(db, run.id, "Symbol listing sync", "PASS", f"{len(sync_result['new_listings'])} new listing(s) detected", details=sync_result)
+            else:
+                add_check_item(db, run.id, "Symbol listing sync", "PASS", "No new listings since last sync")
+        except Exception as exc:
+            warnings += 1
+            add_check_item(db, run.id, "Symbol listing sync", "WARN", safe_error(exc))
 
         accounts = list(db.scalars(select(TradingAccount).order_by(TradingAccount.id)).all())
         enabled = [account for account in accounts if account.enabled]
@@ -765,6 +992,7 @@ async def init_database():
     run_schema_migrations()
     if settings.run_startup_self_check:
         asyncio.create_task(run_system_check())
+    asyncio.create_task(symbol_sync_loop())
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -886,12 +1114,57 @@ async def system_check_now():
     return await run_system_check()
 
 
+@app.get("/api/symbols", dependencies=[Depends(require_token)])
+def list_symbols(exchange: str | None = None, only_new: bool = False, db: Session = Depends(get_db)):
+    query = select(KnownSymbol).order_by(KnownSymbol.first_seen_at.desc())
+    if exchange:
+        query = query.where(KnownSymbol.exchange == exchange.upper())
+    rows = list(db.scalars(query).all())
+    serialized = [serialize_symbol(row) for row in rows]
+    if only_new:
+        serialized = [row for row in serialized if not row["tradeable"]]
+    return serialized
+
+
+@app.post("/api/symbols/sync", dependencies=[Depends(require_token)])
+async def sync_symbols_now(db: Session = Depends(get_db)):
+    return await sync_symbol_listings(db)
+
+
+@app.patch("/api/symbols/{symbol_id}/allow", dependencies=[Depends(require_token)])
+def allow_symbol(symbol_id: int, payload: SymbolAllowUpdate, db: Session = Depends(get_db)):
+    """Manually approve (or revoke approval for) a discovered symbol for
+    trading, independent of the static ALLOWED_SYMBOLS list. This is the
+    default path for turning a first-listing detection into something the
+    risk gate in /api/signals will actually accept, unless
+    AUTO_ALLOW_NEW_LISTINGS=true already set it automatically at discovery
+    time."""
+    row = db.get(KnownSymbol, symbol_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    row.auto_allowed = payload.allowed
+    db.commit()
+    db.refresh(row)
+    write_risk_event(
+        db,
+        "WARN" if payload.allowed else "INFO",
+        "SYMBOL_ALLOW_UPDATED",
+        f"{row.exchange} {row.symbol} trading approval set to {payload.allowed}",
+        {"symbol_id": row.id, "exchange": row.exchange, "symbol": row.symbol},
+    )
+    return serialize_symbol(row)
+
+
 @app.post("/api/signals", dependencies=[Depends(require_token)])
 async def submit_signal(payload: SignalIn, db: Session = Depends(get_db)):
     if db.scalar(select(TradeBatch).where(TradeBatch.request_id == payload.request_id)):
         raise HTTPException(status_code=409, detail="request_id has already been processed")
-    if payload.symbol not in settings.allowed_symbols_set:
+    known = db.scalar(select(KnownSymbol).where(KnownSymbol.symbol == payload.symbol))
+    symbol_allowed = payload.symbol in settings.allowed_symbols_set or (known is not None and known.auto_allowed)
+    if not symbol_allowed:
         raise HTTPException(status_code=400, detail="Symbol is not allowed")
+    if known is not None and known.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Symbol is not currently active on its exchange")
     if payload.leverage > settings.max_leverage or payload.volume > settings.max_order_vol:
         raise HTTPException(status_code=400, detail="Global risk limit exceeded")
     allowed, reason = risk_gate(db, payload.dry_run)
